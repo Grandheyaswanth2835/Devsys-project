@@ -12,7 +12,34 @@ const viewTitles = {
 };
 
 const palette = ['#45d6d1', '#7395ff', '#ad8bff', '#ffb86b', '#fb7185', '#63d9a0', '#7bb7f4'];
-const state = { view: 'overview', offset: 0, limit: 25, filters: {} };
+const state = { view: 'overview', offset: 0, limit: 25, filters: {}, notice: '' };
+const dieFormFields = [
+  ['lot_id', 'Lot ID', 'text'],
+  ['wafer_id', 'Wafer ID', 'text'],
+  ['die_x', 'Die X', 'integer'],
+  ['die_y', 'Die Y', 'integer'],
+  ['radial_pos', 'Radial position (0–1)', 'float', 0, 1],
+  ['ro_speed_mhz', 'RO speed (MHz)', 'float', 0],
+  ['leakage_na', 'Leakage (nA)', 'float', 0],
+  ['iddq_ua', 'IDDQ (µA)', 'float', 0],
+  ['bitcell_vmin_mv', 'Bitcell Vmin (mV)', 'float', 0],
+  ['scan_pass', 'Scan passed', 'boolean'],
+  ['march_failing_mems', 'March failing memories', 'integer', 0],
+  ['early_mats_fails', 'Early MATS+ failures', 'integer', 0],
+  ['repaired_rows', 'Repaired rows', 'integer', 0],
+  ['repaired_cols', 'Repaired columns', 'integer', 0],
+  ['retention_fail', 'Retention failure', 'boolean'],
+  ['dynamic_fault_fail', 'Dynamic fault failure', 'boolean'],
+  ['vmin_corner_only_fail', 'Vmin-corner-only failure', 'boolean'],
+  ['unrepairable', 'Unrepairable', 'boolean'],
+  ['neighbor_fail_cnt', 'Neighbor fail count', 'integer', 0],
+  ['final_bin', 'Final bin', 'bin'],
+  ['t_march_ms', 'March time (ms)', 'float', 0],
+  ['t_retention_ms', 'Retention time (ms)', 'float', 0],
+  ['t_repair_ms', 'Repair time (ms)', 'float', 0],
+  ['t_setup_readout_ms', 'Setup/readout time (ms)', 'float', 0],
+  ['t_total_baseline_ms', 'Total baseline time (ms)', 'float', 0],
+];
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
@@ -30,9 +57,17 @@ function formatBits(value) {
   return `${formatNumber(value)} bit`;
 }
 
-async function api(path) {
-  const response = await fetch(path, { headers: { Accept: 'application/json' } });
-  const payload = await response.json();
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    credentials: 'same-origin',
+    headers: {
+      Accept: 'application/json',
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...options.headers,
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
   return payload;
 }
@@ -174,15 +209,57 @@ function renderCell(field, value) {
   return escapeHtml(value);
 }
 
+function dieFieldMarkup([name, label, type, min, max]) {
+  let input;
+  if (type === 'boolean') {
+    input = `<select class="control" name="${name}" required><option value="">Choose…</option><option value="true">Yes</option><option value="false">No</option></select>`;
+  } else if (type === 'bin') {
+    input = `<select class="control" name="${name}" required><option value="">Choose a bin…</option>${['PASS', 'PASS_REPAIRED', 'FAIL_SCAN', 'FAIL_UNREPAIRABLE', 'FAIL_RETENTION', 'FAIL_DYNAMIC', 'FAIL_VMIN_CORNER'].map((value) => `<option value="${value}">${value}</option>`).join('')}</select>`;
+  } else if (type === 'text') {
+    input = `<input class="control" name="${name}" type="text" maxlength="80" required>`;
+  } else {
+    input = `<input class="control" name="${name}" type="number" ${type === 'integer' ? 'step="1"' : 'step="any"'} ${min !== undefined ? `min="${min}"` : ''} ${max !== undefined ? `max="${max}"` : ''} required>`;
+  }
+  return `<label class="die-field"><span>${escapeHtml(label)}</span>${input}</label>`;
+}
+
+function addDiePanelMarkup(adminSession) {
+  let accessPanel;
+  if (!adminSession.configured) {
+    accessPanel = '<div class="callout">Adding records is not configured yet. The owner must set <code>DIE_ADMIN_PASSWORD</code> and <code>DATABASE_URL</code> in the Render service environment.</div>';
+  } else if (!adminSession.authenticated) {
+    accessPanel = `<form data-admin-login class="admin-login">
+      <label class="die-field"><span>Admin password</span><input class="control" name="password" type="password" autocomplete="current-password" required></label>
+      <button class="button button-quiet" type="submit">Sign in</button>
+      <p class="form-message" data-form-message aria-live="polite"></p>
+    </form>`;
+  } else {
+    accessPanel = `<div class="add-die-toolbar"><span class="panel-hint">Signed in · submissions are saved to PostgreSQL.</span><button class="button button-quiet" type="button" data-admin-logout>Sign out</button></div>
+      <details class="die-form-details"><summary>Add a die record</summary>
+        <p class="panel-hint">The die ID is generated automatically. Enter the complete record; total baseline time must equal the four time components.</p>
+        <form data-add-die-form>
+          <div class="die-form-grid">${dieFormFields.map(dieFieldMarkup).join('')}</div>
+          <button class="button button-quiet" type="submit">Save die record</button>
+          <p class="form-message" data-form-message aria-live="polite">${escapeHtml(state.notice)}</p>
+        </form>
+      </details>`;
+  }
+  return `<section class="panel add-die-panel">
+    <div class="panel-head"><div><h2 class="panel-title">Add a die record</h2><div class="panel-hint">Protected admin entry · new records appear in die results and CSV exports.</div></div></div>
+    ${accessPanel}
+  </section>`;
+}
+
 async function renderTable() {
   const config = tableConfig();
   const params = new URLSearchParams({ limit: String(state.limit), offset: String(state.offset) });
   Object.entries(state.filters).forEach(([key, value]) => { if (value) params.set(key, value); });
   if (state.filters.search) params.set('search', state.filters.search);
   content.innerHTML = '<div class="loading-panel"><span class="spinner"></span>Loading records…</div>';
-  const [result, summary] = await Promise.all([
+  const [result, summary, adminSession] = await Promise.all([
     api(`${config.endpoint}?${params}`),
     state.view === 'dies' ? api('/api/summary') : Promise.resolve(null),
+    state.view === 'dies' ? api('/api/admin/session') : Promise.resolve(null),
   ]);
   const filterControls = config.filters.map((filter) => {
     const options = filter.options.length
@@ -201,6 +278,7 @@ async function renderTable() {
   const last = Math.min(result.offset + result.limit, result.total);
   content.innerHTML = `
     ${pageHeader(config.heading, config.subtitle, config.eyebrow)}
+    ${state.view === 'dies' ? addDiePanelMarkup(adminSession) : ''}
     <div class="panel">
       <div class="panel-head"><div><h2 class="panel-title">${formatNumber(result.total)} records</h2><div class="panel-hint">Filter, inspect, and export the original CSV dataset.</div></div>
         <a class="button button-quiet" href="/api/download/${config.download}">Download CSV</a></div>
@@ -233,6 +311,67 @@ async function renderTable() {
       renderTable().catch(showError);
     });
   });
+  const loginForm = content.querySelector('[data-admin-login]');
+  if (loginForm) {
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = loginForm.querySelector('[data-form-message]');
+      const button = loginForm.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await api('/api/admin/session', {
+          method: 'POST',
+          body: JSON.stringify({ password: new FormData(loginForm).get('password') }),
+        });
+        state.notice = '';
+        renderTable().catch(showError);
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+  const logoutButton = content.querySelector('[data-admin-logout]');
+  if (logoutButton) {
+    logoutButton.addEventListener('click', async () => {
+      try {
+        await api('/api/admin/session', { method: 'DELETE' });
+        state.notice = '';
+        renderTable().catch(showError);
+      } catch (error) {
+        showError(error);
+      }
+    });
+  }
+  const addDieForm = content.querySelector('[data-add-die-form]');
+  if (addDieForm) {
+    addDieForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = addDieForm.querySelector('[data-form-message]');
+      const button = addDieForm.querySelector('button[type="submit"]');
+      const payload = Object.fromEntries(new FormData(addDieForm).entries());
+      dieFormFields.forEach(([name, , type]) => {
+        if (type === 'boolean') payload[name] = payload[name] === 'true';
+        else if (type === 'integer' || type === 'float') payload[name] = Number(payload[name]);
+      });
+      button.disabled = true;
+      message.textContent = 'Saving record…';
+      try {
+        const result = await api('/api/dies', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        state.notice = `Saved ${result.item.die_id}.`;
+        state.offset = 0;
+        renderTable().catch(showError);
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
 }
 
 function renderAlgorithmCard(group) {

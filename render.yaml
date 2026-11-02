@@ -3,6 +3,6 @@ services:
     name: mbist-dashboard
     runtime: python
     plan: free
-    buildCommand: python -m compileall -q backend
+    buildCommand: pip install -r requirements.txt && python -m compileall -q backend
     startCommand: python -m backend.app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health

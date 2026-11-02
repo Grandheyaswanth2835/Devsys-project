@@ -129,6 +129,23 @@ README.md
 | `GET /api/memories` | Memory records; accepts `mem_type`, `bitcell`, `search`, `limit`, `offset` |
 | `GET /api/failures` | Fail events; accepts `fault_type`, `bitcell`, `search`, `limit`, `offset` |
 | `GET /api/download/{dies\|memories\|failures}` | Download the corresponding source CSV |
+| `GET /api/admin/session` | Check whether protected die-entry access is configured and signed in |
+| `POST /api/admin/session` | Sign in with the shared admin password; sets an HTTP-only session cookie |
+| `DELETE /api/admin/session` | Sign out |
+| `POST /api/dies` | Add a die record (admin session required; persisted in PostgreSQL) |
+
+### Configure protected die entry
+
+The **Die results** view includes an admin-only form for adding complete die records. The server generates each new `die_id`; successful submissions appear in the die table and downloaded die CSV.
+
+Set these variables in the Render service's **Environment** settings:
+
+- `DIE_ADMIN_PASSWORD`: a unique password of at least 20 characters for the data-entry administrator.
+- `DATABASE_URL`: the connection string for an existing PostgreSQL database. The application creates the `mbist_added_dies` table automatically; the database user needs permission to create tables and insert/select rows.
+
+After setting both variables, redeploy the service. Until they are configured, browsing the dashboard remains available, while the entry form reports that submissions are disabled. Keep the database URL and password private; do not commit them to the repository. Locally, set the same variables in the process environment before starting the server.
+
+New records are stored in PostgreSQL and appended to the original synthetic CSV data in the dashboard. The source CSV files are unchanged. These submitted records are user-entered and may not be synthetic; they should not be treated as silicon sign-off without independent verification.
 
 All provided values and derived dashboard metrics are synthetic, not production measurements or a silicon sign-off. The dashboard's algorithm coverage and scheduler are deterministic calculations over the included data; the adaptive-flow model results in `validation_report.txt` remain reference results from the separate validation script.
 

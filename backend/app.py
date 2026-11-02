@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import hmac
+import io
 import json
 import logging
 import math
+import os
 import re
+import secrets
+import time
+import uuid
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -61,6 +68,30 @@ FLOAT_COLUMNS = {
     "t_setup_readout_ms", "t_total_baseline_ms", "test_power_mw",
     "march_ss_time_us",
 }
+NEW_DIE_INTEGER_FIELDS = {
+    "die_x", "die_y", "march_failing_mems", "early_mats_fails",
+    "repaired_rows", "repaired_cols", "neighbor_fail_cnt",
+}
+NEW_DIE_FLOAT_FIELDS = {
+    "radial_pos", "ro_speed_mhz", "leakage_na", "iddq_ua",
+    "bitcell_vmin_mv", "t_march_ms", "t_retention_ms", "t_repair_ms",
+    "t_setup_readout_ms", "t_total_baseline_ms",
+}
+NEW_DIE_BOOLEAN_FIELDS = {
+    "scan_pass", "retention_fail", "dynamic_fault_fail",
+    "vmin_corner_only_fail", "unrepairable",
+}
+NEW_DIE_TEXT_FIELDS = {"lot_id", "wafer_id", "final_bin"}
+NEW_DIE_FIELDS = (
+    NEW_DIE_TEXT_FIELDS
+    | NEW_DIE_INTEGER_FIELDS
+    | NEW_DIE_FLOAT_FIELDS
+    | NEW_DIE_BOOLEAN_FIELDS
+)
+FINAL_BINS = {
+    "PASS", "PASS_REPAIRED", "FAIL_SCAN", "FAIL_UNREPAIRABLE",
+    "FAIL_RETENTION", "FAIL_DYNAMIC", "FAIL_VMIN_CORNER",
+}
 ALGORITHMS = (
     ("MATSplus", "det_MATSplus", 5),
     ("MarchCm", "det_MarchCm", 10),
@@ -72,6 +103,10 @@ ALGORITHMS = (
 
 class DatasetError(Exception):
     """Raised when an input dataset is missing or malformed."""
+
+
+class StorageError(DatasetError):
+    """Raised when persistent die storage is unavailable or misconfigured."""
 
 
 def _convert_row(row: dict[str, str | None], table: str, line_number: int) -> dict:
@@ -154,8 +189,226 @@ def load_dataset(data_dir: Path = ROOT / "data") -> dict[str, list[dict]]:
 
 
 @lru_cache(maxsize=1)
-def get_dataset() -> dict[str, list[dict]]:
+def _get_base_dataset() -> dict[str, list[dict]]:
     return load_dataset()
+
+
+def _database_url() -> str | None:
+    return os.environ.get("DATABASE_URL") or None
+
+
+def _read_added_dies() -> list[dict]:
+    database_url = _database_url()
+    if not database_url:
+        return []
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise StorageError(
+            "PostgreSQL support is unavailable. Install the project requirements."
+        ) from exc
+    try:
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT record FROM mbist_added_dies ORDER BY created_at, die_id"
+                )
+                return [row[0] for row in cursor.fetchall()]
+    except psycopg.errors.UndefinedTable:
+        return []
+    except psycopg.Error as exc:
+        logging.exception("Unable to read added die records from PostgreSQL")
+        raise StorageError(
+            "Unable to read added die records. Check DATABASE_URL and database access."
+        ) from exc
+
+
+def get_dataset() -> dict[str, list[dict]]:
+    data = {name: list(rows) for name, rows in _get_base_dataset().items()}
+    data["dies"].extend(_read_added_dies())
+    return data
+
+
+def initialize_die_storage() -> None:
+    database_url = _database_url()
+    if not database_url:
+        return
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise StorageError(
+            "PostgreSQL support is unavailable. Install the project requirements."
+        ) from exc
+    try:
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mbist_added_dies (
+                        die_id TEXT PRIMARY KEY,
+                        record JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+    except psycopg.Error as exc:
+        logging.exception("Unable to initialize PostgreSQL die storage")
+        raise StorageError(
+            "Unable to initialize die storage. Check DATABASE_URL and database permissions."
+        ) from exc
+
+
+def validate_new_die(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("The die record must be a JSON object.")
+    if set(payload) != NEW_DIE_FIELDS:
+        missing = NEW_DIE_FIELDS - set(payload)
+        extra = set(payload) - NEW_DIE_FIELDS
+        details = []
+        if missing:
+            details.append(f"missing fields: {', '.join(sorted(missing))}")
+        if extra:
+            details.append(f"unexpected fields: {', '.join(sorted(extra))}")
+        raise ValueError("Invalid die record (" + "; ".join(details) + ").")
+
+    record = {}
+    for field in sorted(NEW_DIE_TEXT_FIELDS):
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} is required.")
+        value = value.strip()
+        if len(value) > 80:
+            raise ValueError(f"{field} must be 80 characters or fewer.")
+        if field == "final_bin" and value not in FINAL_BINS:
+            raise ValueError("final_bin is not a supported bin.")
+        record[field] = value
+
+    for field in sorted(NEW_DIE_BOOLEAN_FIELDS):
+        value = payload[field]
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} must be true or false.")
+        record[field] = value
+
+    for field in sorted(NEW_DIE_INTEGER_FIELDS):
+        value = payload[field]
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be an integer.")
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer.") from exc
+        if str(number) != str(value).strip() or number < 0 and field not in {"die_x", "die_y"}:
+            raise ValueError(f"{field} must be a valid integer.")
+        record[field] = number
+
+    for field in sorted(NEW_DIE_FLOAT_FIELDS):
+        value = payload[field]
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be numeric.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be numeric.") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field} must be finite.")
+        if number < 0:
+            raise ValueError(f"{field} cannot be negative.")
+        record[field] = number
+
+    if not 0 <= record["radial_pos"] <= 1:
+        raise ValueError("radial_pos must be between 0 and 1.")
+    if record["t_total_baseline_ms"] != round(
+        record["t_march_ms"] + record["t_retention_ms"]
+        + record["t_repair_ms"] + record["t_setup_readout_ms"], 1
+    ):
+        raise ValueError("t_total_baseline_ms must equal the sum of the time components.")
+    record["die_id"] = f"EXT-{uuid.uuid4().hex[:12].upper()}"
+    return record
+
+
+def _save_added_die(record: dict) -> None:
+    database_url = _database_url()
+    if not database_url:
+        raise StorageError(
+            "Die submissions are not enabled yet. Configure DATABASE_URL in Render."
+        )
+    try:
+        import psycopg
+        from psycopg.types.json import Jsonb
+    except ImportError as exc:
+        raise StorageError(
+            "PostgreSQL support is unavailable. Install the project requirements."
+        ) from exc
+    try:
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mbist_added_dies (
+                        die_id TEXT PRIMARY KEY,
+                        record JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "INSERT INTO mbist_added_dies (die_id, record) VALUES (%s, %s)",
+                    (record["die_id"], Jsonb(record)),
+                )
+    except psycopg.Error as exc:
+        logging.exception("Unable to save added die record")
+        raise StorageError(
+            "Unable to save die record. Check DATABASE_URL and database permissions."
+        ) from exc
+
+
+def _admin_password() -> str | None:
+    password = os.environ.get("DIE_ADMIN_PASSWORD")
+    return password if password and len(password) >= 20 else None
+
+
+def _session_cookie_value(password: str, expiry: int, nonce: str) -> str:
+    message = f"{expiry}:{nonce}".encode("utf-8")
+    signature = hmac.new(
+        hashlib.sha256(password.encode("utf-8")).digest(),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{expiry}:{nonce}:{signature}"
+
+
+def _valid_admin_session(cookie_header: str | None) -> bool:
+    password = _admin_password()
+    if not password or not cookie_header:
+        return False
+    cookies = {}
+    for item in cookie_header.split(";"):
+        key, separator, value = item.strip().partition("=")
+        if separator:
+            cookies[key] = value
+    value = cookies.get("mbist_admin")
+    if not value:
+        return False
+    try:
+        expiry_text, nonce, signature = value.split(":", 2)
+        expiry = int(expiry_text)
+    except (ValueError, TypeError):
+        return False
+    if expiry <= int(time.time()):
+        return False
+    expected = _session_cookie_value(password, expiry, nonce)
+    return hmac.compare_digest(signature, expected.rsplit(":", 1)[1])
+
+
+def validate_request_origin(headers) -> bool:
+    origin = headers.get("Origin")
+    host = headers.get("Host")
+    if not origin or not host:
+        return False
+    protocol = headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip()
+    if protocol not in {"http", "https"}:
+        return False
+    return hmac.compare_digest(origin.rstrip("/"), f"{protocol}://{host}".rstrip("/"))
 
 
 def _mean(rows: list[dict], column: str) -> float:
@@ -512,6 +765,21 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
                     {
                         "status": "ok",
                         "rows": {name: len(rows) for name, rows in data.items()},
+                        "die_submission_enabled": bool(
+                            _database_url() and _admin_password()
+                        ),
+                    },
+                )
+            elif path == "/api/admin/session":
+                self._send_json(
+                    200,
+                    {
+                        "configured": bool(_admin_password() and _database_url()),
+                        "storage_configured": bool(_database_url()),
+                        "admin_password_configured": bool(_admin_password()),
+                        "authenticated": _valid_admin_session(
+                            self.headers.get("Cookie")
+                        ),
                     },
                 )
             elif path == "/api/summary":
@@ -531,9 +799,113 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
                 self._send_error_json(404, "Route not found.")
         except ValueError as exc:
             self._send_error_json(400, str(exc))
+        except StorageError as exc:
+            logging.error("Die storage unavailable: %s", exc)
+            self._send_error_json(503, str(exc))
         except DatasetError as exc:
             logging.exception("Dataset unavailable or invalid")
             self._send_error_json(500, str(exc))
+
+    def _read_json_body(self) -> dict:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json.")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Content-Length must be a valid integer.") from exc
+        if not 0 < length <= 16_384:
+            raise ValueError("Request body must be between 1 and 16384 bytes.")
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Request body must contain valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return payload
+
+    def _request_origin_is_valid(self) -> bool:
+        return validate_request_origin(self.headers)
+
+    def _send_session_cookie(self, password: str) -> None:
+        expiry = int(time.time()) + 8 * 60 * 60
+        value = _session_cookie_value(password, expiry, secrets.token_urlsafe(24))
+        secure = (
+            self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+            == "https"
+        )
+        self.send_response(200)
+        self._headers("application/json; charset=utf-8", len(b'{"authenticated":true}'))
+        self.send_header(
+            "Set-Cookie",
+            "mbist_admin=" + value
+            + f"; Path=/; Max-Age={8 * 60 * 60}; HttpOnly; SameSite=Strict"
+            + ("; Secure" if secure else ""),
+        )
+        self.end_headers()
+        self.wfile.write(b'{"authenticated":true}')
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            if not self._request_origin_is_valid():
+                self._send_error_json(403, "Request origin is not allowed.")
+                return
+            if path == "/api/admin/session":
+                if not _admin_password():
+                    self._send_error_json(
+                        503, "Admin access is not configured on the server."
+                    )
+                    return
+                payload = self._read_json_body()
+                supplied = payload.get("password")
+                if not isinstance(supplied, str) or not hmac.compare_digest(
+                    supplied, _admin_password()
+                ):
+                    self._send_error_json(401, "Incorrect admin password.")
+                    return
+                self._send_session_cookie(_admin_password())
+            elif path == "/api/dies":
+                if not _valid_admin_session(self.headers.get("Cookie")):
+                    self._send_error_json(401, "Sign in with the admin password first.")
+                    return
+                if not _database_url():
+                    self._send_error_json(
+                        503, "Die submissions are not enabled yet. Configure DATABASE_URL in Render."
+                    )
+                    return
+                record = validate_new_die(self._read_json_body())
+                _save_added_die(record)
+                self._send_json(201, {"item": record, "saved": True})
+            else:
+                self._send_error_json(404, "Route not found.")
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+        except StorageError as exc:
+            logging.error("Die storage unavailable: %s", exc)
+            self._send_error_json(503, str(exc))
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path != "/api/admin/session":
+            self._send_error_json(404, "Route not found.")
+            return
+        if not self._request_origin_is_valid():
+            self._send_error_json(403, "Request origin is not allowed.")
+            return
+        secure = (
+            self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+            == "https"
+        )
+        self.send_response(200)
+        self._headers("application/json; charset=utf-8", len(b'{"authenticated":false}'))
+        self.send_header(
+            "Set-Cookie",
+            "mbist_admin=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+            + ("; Secure" if secure else ""),
+        )
+        self.end_headers()
+        self.wfile.write(b'{"authenticated":false}')
 
     def _send_static(self, filename: str) -> None:
         if filename not in ("index.html", "app.js", "styles.css"):
@@ -561,6 +933,18 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
             logging.exception("Unable to read dataset export %s", path)
             self._send_error_json(500, f"Unable to read {DATA_FILES[table]}.")
             return
+        if table == "dies":
+            added_dies = _read_added_dies()
+            if added_dies:
+                with path.open("r", encoding="utf-8-sig", newline="") as source:
+                    fieldnames = next(csv.reader(source))
+                extra = io.StringIO(newline="")
+                writer = csv.DictWriter(
+                    extra, fieldnames=fieldnames, lineterminator="\n"
+                )
+                writer.writerows(added_dies)
+                body += (b"" if body.endswith((b"\n", b"\r")) else b"\n")
+                body += extra.getvalue().encode("utf-8")
         self.send_response(200)
         self._headers("text/csv; charset=utf-8", len(body))
         self.send_header(
@@ -582,6 +966,7 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    initialize_die_storage()
     data = get_dataset()
     logging.info(
         "Loaded %d dies, %d memories, and %d fail events",
