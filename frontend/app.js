@@ -227,24 +227,24 @@ function dieFieldMarkup([name, label, type, min, max], record = null) {
 
 function addDiePanelMarkup(databaseReady) {
   const record = state.editingRecord;
-  const heading = record ? `Update ${escapeHtml(record.die_id)}` : 'Add a die record';
+  const heading = record ? `Edit die ${escapeHtml(record.die_id)}` : 'Add die test results';
   const accessPanel = databaseReady
     ? `<details class="die-form-details" ${record ? 'open' : ''}>
-        <summary>${record ? 'Editing this die' : 'Add a die'}</summary>
+        <summary>${record ? 'Edit test results' : 'Add die test results'}</summary>
         <p class="panel-hint">${record
-          ? 'Make your changes below. The existing die ID will be kept.'
-          : 'Enter the die and test details below. A new ID will be created when you save.'}
-          Please check that total test time matches the component times.</p>
+          ? 'Update the results below. The die ID will stay the same.'
+          : "Enter the die and test results. We'll assign an ID when you save."}
+          Double-check that total test time matches the component times.</p>
         <form data-die-form>
           <div class="die-form-grid">${dieFormFields.map((field) => dieFieldMarkup(field, record)).join('')}</div>
-          <div class="form-actions"><button class="button button-quiet" type="submit">${record ? 'Save changes' : 'Add die'}</button>
+          <div class="form-actions"><button class="button button-quiet" type="submit">${record ? 'Save changes' : 'Add results'}</button>
             ${record ? '<button class="button button-quiet" type="button" data-cancel-edit>Cancel</button>' : ''}</div>
           <p class="form-message" data-form-message aria-live="polite"></p>
         </form>
       </details>`
-    : '<div class="callout">The website owner still needs to connect a database before new records and edits can be saved.</div>';
+    : '<div class="callout">Adding and editing are not available yet because the site database has not been connected.</div>';
   return `<section class="panel add-die-panel">
-    <div class="panel-head"><div><h2 class="panel-title">${heading}</h2><div class="panel-hint">Add a new die or update the results for an existing one. Changes are visible to everyone.</div></div></div>
+    <div class="panel-head"><div><h2 class="panel-title">${heading}</h2><div class="panel-hint">Add results for a die or update an existing entry. No account is needed, and everyone can see saved changes.</div></div></div>
     ${state.notice ? `<p class="success-message" role="status">${escapeHtml(state.notice)}</p>` : ''}
     ${accessPanel}
   </section>`;
@@ -336,7 +336,7 @@ async function renderTable() {
         else if (type === 'integer' || type === 'float') payload[name] = Number(payload[name]);
       });
       button.disabled = true;
-      message.textContent = 'Saving record…';
+      message.textContent = 'Saving...';
       try {
         const isEditing = Boolean(state.editingRecord);
         const endpoint = isEditing
@@ -347,8 +347,8 @@ async function renderTable() {
           body: JSON.stringify(payload),
         });
         state.notice = isEditing
-          ? `Changes to ${result.item.die_id} are saved.`
-          : `${result.item.die_id} has been added.`;
+          ? `Changes to ${result.item.die_id} saved.`
+          : `Die ${result.item.die_id} added. It's now in the results.`;
         state.editingRecord = null;
         state.offset = 0;
         renderTable().catch(showError);
