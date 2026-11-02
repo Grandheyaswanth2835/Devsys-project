@@ -126,24 +126,21 @@ README.md
 | `GET /api/summary` | Dataset totals and chart aggregates |
 | `GET /api/analysis` | Algorithm coverage and scheduling results |
 | `GET /api/dies` | Die records; accepts `lot`, `bin`, `search`, `limit`, `offset` |
+| `GET /api/dies/{die_id}` | Get a complete die record for editing |
 | `GET /api/memories` | Memory records; accepts `mem_type`, `bitcell`, `search`, `limit`, `offset` |
 | `GET /api/failures` | Fail events; accepts `fault_type`, `bitcell`, `search`, `limit`, `offset` |
 | `GET /api/download/{dies\|memories\|failures}` | Download the corresponding source CSV |
-| `GET /api/admin/session` | Check whether protected die-entry access is configured and signed in |
-| `POST /api/admin/session` | Sign in with the shared admin password; sets an HTTP-only session cookie |
-| `DELETE /api/admin/session` | Sign out |
-| `POST /api/dies` | Add a die record (admin session required; persisted in PostgreSQL) |
+| `GET /api/die-editing/status` | Check whether die changes are enabled |
+| `POST /api/dies` | Add a die record (public; persisted in PostgreSQL) |
+| `PUT /api/dies/{die_id}` | Update an existing die record (public; saved as a PostgreSQL override) |
 
-### Configure protected die entry
+### Public die entry
 
-The **Die results** view includes an admin-only form for adding complete die records. The server generates each new `die_id`; successful submissions appear in the die table and downloaded die CSV.
+The **Die results** view lets anyone with the website link add a die or edit an existing record. No account or password is required. New die IDs are generated automatically. Updates to the original synthetic records are saved as PostgreSQL overrides; the source CSV files remain unchanged. New and updated records appear in the die table and downloaded die CSV.
 
-Set these variables in the Render service's **Environment** settings:
+Connect a PostgreSQL database by setting `DATABASE_URL` in the Render service's **Environment** settings. The application creates the `mbist_added_dies` and `mbist_die_overrides` tables automatically. The database user needs permission to create tables and read/write rows. Until a database URL is configured, the dashboard remains available but the add/edit controls are disabled.
 
-- `DIE_ADMIN_PASSWORD`: a unique password of at least 20 characters for the data-entry administrator.
-- `DATABASE_URL`: the connection string for an existing PostgreSQL database. The application creates the `mbist_added_dies` table automatically; the database user needs permission to create tables and insert/select rows.
-
-After setting both variables, redeploy the service. Until they are configured, browsing the dashboard remains available, while the entry form reports that submissions are disabled. Keep the database URL and password private; do not commit them to the repository. Locally, set the same variables in the process environment before starting the server.
+Public changes are rate-limited to 30 submissions per minute from a single client IP and must come from the dashboard's own website origin. Because editing is public, any visitor can change records; do not use this mode for confidential or production sign-off data. Locally, set `DATABASE_URL` in the process environment before starting the server.
 
 New records are stored in PostgreSQL and appended to the original synthetic CSV data in the dashboard. The source CSV files are unchanged. These submitted records are user-entered and may not be synthetic; they should not be treated as silicon sign-off without independent verification.
 

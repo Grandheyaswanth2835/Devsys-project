@@ -12,7 +12,7 @@ const viewTitles = {
 };
 
 const palette = ['#45d6d1', '#7395ff', '#ad8bff', '#ffb86b', '#fb7185', '#63d9a0', '#7bb7f4'];
-const state = { view: 'overview', offset: 0, limit: 25, filters: {}, notice: '' };
+const state = { view: 'overview', offset: 0, limit: 25, filters: {}, notice: '', editingRecord: null };
 const dieFormFields = [
   ['lot_id', 'Lot ID', 'text'],
   ['wafer_id', 'Wafer ID', 'text'],
@@ -148,6 +148,7 @@ function setView(view) {
   state.view = view;
   state.offset = 0;
   state.filters = {};
+  state.editingRecord = null;
   navItems.forEach((item) => item.classList.toggle('active', item.dataset.view === view));
   crumb.textContent = viewTitles[view];
   if (view === 'overview') renderOverview().catch(showError);
@@ -209,43 +210,42 @@ function renderCell(field, value) {
   return escapeHtml(value);
 }
 
-function dieFieldMarkup([name, label, type, min, max]) {
+function dieFieldMarkup([name, label, type, min, max], record = null) {
+  const value = record?.[name];
   let input;
   if (type === 'boolean') {
-    input = `<select class="control" name="${name}" required><option value="">Choose…</option><option value="true">Yes</option><option value="false">No</option></select>`;
+    input = `<select class="control" name="${name}" required><option value="">Choose…</option><option value="true" ${value === true ? 'selected' : ''}>Yes</option><option value="false" ${value === false ? 'selected' : ''}>No</option></select>`;
   } else if (type === 'bin') {
-    input = `<select class="control" name="${name}" required><option value="">Choose a bin…</option>${['PASS', 'PASS_REPAIRED', 'FAIL_SCAN', 'FAIL_UNREPAIRABLE', 'FAIL_RETENTION', 'FAIL_DYNAMIC', 'FAIL_VMIN_CORNER'].map((value) => `<option value="${value}">${value}</option>`).join('')}</select>`;
+    input = `<select class="control" name="${name}" required><option value="">Choose a bin…</option>${['PASS', 'PASS_REPAIRED', 'FAIL_SCAN', 'FAIL_UNREPAIRABLE', 'FAIL_RETENTION', 'FAIL_DYNAMIC', 'FAIL_VMIN_CORNER'].map((option) => `<option value="${option}" ${value === option ? 'selected' : ''}>${option.replaceAll('_', ' ')}</option>`).join('')}</select>`;
   } else if (type === 'text') {
-    input = `<input class="control" name="${name}" type="text" maxlength="80" required>`;
+    input = `<input class="control" name="${name}" type="text" maxlength="80" value="${escapeHtml(value ?? '')}" required>`;
   } else {
-    input = `<input class="control" name="${name}" type="number" ${type === 'integer' ? 'step="1"' : 'step="any"'} ${min !== undefined ? `min="${min}"` : ''} ${max !== undefined ? `max="${max}"` : ''} required>`;
+    input = `<input class="control" name="${name}" type="number" ${type === 'integer' ? 'step="1"' : 'step="any"'} ${min !== undefined ? `min="${min}"` : ''} ${max !== undefined ? `max="${max}"` : ''} value="${value === undefined ? '' : escapeHtml(value)}" required>`;
   }
   return `<label class="die-field"><span>${escapeHtml(label)}</span>${input}</label>`;
 }
 
-function addDiePanelMarkup(adminSession) {
-  let accessPanel;
-  if (!adminSession.configured) {
-    accessPanel = '<div class="callout">Adding records is not configured yet. The owner must set <code>DIE_ADMIN_PASSWORD</code> and <code>DATABASE_URL</code> in the Render service environment.</div>';
-  } else if (!adminSession.authenticated) {
-    accessPanel = `<form data-admin-login class="admin-login">
-      <label class="die-field"><span>Admin password</span><input class="control" name="password" type="password" autocomplete="current-password" required></label>
-      <button class="button button-quiet" type="submit">Sign in</button>
-      <p class="form-message" data-form-message aria-live="polite"></p>
-    </form>`;
-  } else {
-    accessPanel = `<div class="add-die-toolbar"><span class="panel-hint">Signed in · submissions are saved to PostgreSQL.</span><button class="button button-quiet" type="button" data-admin-logout>Sign out</button></div>
-      <details class="die-form-details"><summary>Add a die record</summary>
-        <p class="panel-hint">The die ID is generated automatically. Enter the complete record; total baseline time must equal the four time components.</p>
-        <form data-add-die-form>
-          <div class="die-form-grid">${dieFormFields.map(dieFieldMarkup).join('')}</div>
-          <button class="button button-quiet" type="submit">Save die record</button>
-          <p class="form-message" data-form-message aria-live="polite">${escapeHtml(state.notice)}</p>
+function addDiePanelMarkup(databaseReady) {
+  const record = state.editingRecord;
+  const heading = record ? `Update ${escapeHtml(record.die_id)}` : 'Add a die record';
+  const accessPanel = databaseReady
+    ? `<details class="die-form-details" ${record ? 'open' : ''}>
+        <summary>${record ? 'Editing this die' : 'Add a die'}</summary>
+        <p class="panel-hint">${record
+          ? 'Make your changes below. The existing die ID will be kept.'
+          : 'Enter the die and test details below. A new ID will be created when you save.'}
+          Please check that total test time matches the component times.</p>
+        <form data-die-form>
+          <div class="die-form-grid">${dieFormFields.map((field) => dieFieldMarkup(field, record)).join('')}</div>
+          <div class="form-actions"><button class="button button-quiet" type="submit">${record ? 'Save changes' : 'Add die'}</button>
+            ${record ? '<button class="button button-quiet" type="button" data-cancel-edit>Cancel</button>' : ''}</div>
+          <p class="form-message" data-form-message aria-live="polite"></p>
         </form>
-      </details>`;
-  }
+      </details>`
+    : '<div class="callout">The website owner still needs to connect a database before new records and edits can be saved.</div>';
   return `<section class="panel add-die-panel">
-    <div class="panel-head"><div><h2 class="panel-title">Add a die record</h2><div class="panel-hint">Protected admin entry · new records appear in die results and CSV exports.</div></div></div>
+    <div class="panel-head"><div><h2 class="panel-title">${heading}</h2><div class="panel-hint">Add a new die or update the results for an existing one. Changes are visible to everyone.</div></div></div>
+    ${state.notice ? `<p class="success-message" role="status">${escapeHtml(state.notice)}</p>` : ''}
     ${accessPanel}
   </section>`;
 }
@@ -256,10 +256,10 @@ async function renderTable() {
   Object.entries(state.filters).forEach(([key, value]) => { if (value) params.set(key, value); });
   if (state.filters.search) params.set('search', state.filters.search);
   content.innerHTML = '<div class="loading-panel"><span class="spinner"></span>Loading records…</div>';
-  const [result, summary, adminSession] = await Promise.all([
+  const [result, summary, editStatus] = await Promise.all([
     api(`${config.endpoint}?${params}`),
     state.view === 'dies' ? api('/api/summary') : Promise.resolve(null),
-    state.view === 'dies' ? api('/api/admin/session') : Promise.resolve(null),
+    state.view === 'dies' ? api('/api/die-editing/status') : Promise.resolve(null),
   ]);
   const filterControls = config.filters.map((filter) => {
     const options = filter.options.length
@@ -271,16 +271,16 @@ async function renderTable() {
   }).join('');
   const searchValue = state.filters.search || '';
   const table = result.items.length
-    ? `<div class="table-wrap"><table class="data-table"><thead><tr>${result.fields.map((field) => `<th>${escapeHtml(field.replaceAll('_', ' '))}</th>`).join('')}</tr></thead>
-      <tbody>${result.items.map((row) => `<tr>${result.fields.map((field) => `<td>${renderCell(field, row[field])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+    ? `<div class="table-wrap"><table class="data-table"><thead><tr>${result.fields.map((field) => `<th>${escapeHtml(field.replaceAll('_', ' '))}</th>`).join('')}${editStatus?.configured ? '<th>Actions</th>' : ''}</tr></thead>
+      <tbody>${result.items.map((row) => `<tr>${result.fields.map((field) => `<td>${renderCell(field, row[field])}</td>`).join('')}${editStatus?.configured ? `<td><button class="button button-quiet button-small" type="button" data-edit-die="${escapeHtml(row.die_id)}">Edit</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`
     : '<div class="empty-state">No records match these filters.</div>';
   const first = result.total ? result.offset + 1 : 0;
   const last = Math.min(result.offset + result.limit, result.total);
   content.innerHTML = `
     ${pageHeader(config.heading, config.subtitle, config.eyebrow)}
-    ${state.view === 'dies' ? addDiePanelMarkup(adminSession) : ''}
+    ${state.view === 'dies' ? addDiePanelMarkup(editStatus.configured) : ''}
     <div class="panel">
-      <div class="panel-head"><div><h2 class="panel-title">${formatNumber(result.total)} records</h2><div class="panel-hint">Filter, inspect, and export the original CSV dataset.</div></div>
+      <div class="panel-head"><div><h2 class="panel-title">${formatNumber(result.total)} records</h2><div class="panel-hint">Search, filter, edit, or download the die results.</div></div>
         <a class="button button-quiet" href="/api/download/${config.download}">Download CSV</a></div>
       <div class="filter-row">${filterControls}<input class="control search" data-search type="search" value="${escapeHtml(searchValue)}" placeholder="${escapeHtml(config.search)}" aria-label="${escapeHtml(config.search)}"></div>
       ${table}
@@ -311,46 +311,26 @@ async function renderTable() {
       renderTable().catch(showError);
     });
   });
-  const loginForm = content.querySelector('[data-admin-login]');
-  if (loginForm) {
-    loginForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const message = loginForm.querySelector('[data-form-message]');
-      const button = loginForm.querySelector('button[type="submit"]');
-      button.disabled = true;
+  content.querySelectorAll('[data-edit-die]').forEach((button) => {
+    button.addEventListener('click', async () => {
       try {
-        await api('/api/admin/session', {
-          method: 'POST',
-          body: JSON.stringify({ password: new FormData(loginForm).get('password') }),
-        });
+          const result = await api(`/api/dies/${encodeURIComponent(button.dataset.editDie)}`);
+        state.editingRecord = result.item;
         state.notice = '';
         renderTable().catch(showError);
-      } catch (error) {
-        message.textContent = error.message;
-      } finally {
-        button.disabled = false;
-      }
-    });
-  }
-  const logoutButton = content.querySelector('[data-admin-logout]');
-  if (logoutButton) {
-    logoutButton.addEventListener('click', async () => {
-      try {
-        await api('/api/admin/session', { method: 'DELETE' });
-        state.notice = '';
-        renderTable().catch(showError);
+        content.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (error) {
         showError(error);
       }
     });
-  }
-  const addDieForm = content.querySelector('[data-add-die-form]');
-  if (addDieForm) {
-    addDieForm.addEventListener('submit', async (event) => {
+  });
+  const dieForm = content.querySelector('[data-die-form]');
+  if (dieForm) {
+    dieForm.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const message = addDieForm.querySelector('[data-form-message]');
-      const button = addDieForm.querySelector('button[type="submit"]');
-      const payload = Object.fromEntries(new FormData(addDieForm).entries());
+      const message = dieForm.querySelector('[data-form-message]');
+      const button = dieForm.querySelector('button[type="submit"]');
+      const payload = Object.fromEntries(new FormData(dieForm).entries());
       dieFormFields.forEach(([name, , type]) => {
         if (type === 'boolean') payload[name] = payload[name] === 'true';
         else if (type === 'integer' || type === 'float') payload[name] = Number(payload[name]);
@@ -358,11 +338,18 @@ async function renderTable() {
       button.disabled = true;
       message.textContent = 'Saving record…';
       try {
-        const result = await api('/api/dies', {
-          method: 'POST',
+        const isEditing = Boolean(state.editingRecord);
+        const endpoint = isEditing
+          ? `/api/dies/${encodeURIComponent(state.editingRecord.die_id)}`
+          : '/api/dies';
+        const result = await api(endpoint, {
+          method: isEditing ? 'PUT' : 'POST',
           body: JSON.stringify(payload),
         });
-        state.notice = `Saved ${result.item.die_id}.`;
+        state.notice = isEditing
+          ? `Changes to ${result.item.die_id} are saved.`
+          : `${result.item.die_id} has been added.`;
+        state.editingRecord = null;
         state.offset = 0;
         renderTable().catch(showError);
       } catch (error) {
@@ -370,6 +357,14 @@ async function renderTable() {
       } finally {
         button.disabled = false;
       }
+    });
+  }
+  const cancelEdit = content.querySelector('[data-cancel-edit]');
+  if (cancelEdit) {
+    cancelEdit.addEventListener('click', () => {
+      state.editingRecord = null;
+      state.notice = '';
+      renderTable().catch(showError);
     });
   }
 }

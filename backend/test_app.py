@@ -10,13 +10,13 @@ from unittest.mock import patch
 import app as app_module
 from app import (
     MbistRequestHandler,
-    _session_cookie_value,
-    _valid_admin_session,
+    validate_added_die,
     build_analysis,
     build_summary,
     load_dataset,
     query_table,
     validate_new_die,
+    validate_die_update,
     validate_request_origin,
 )
 
@@ -103,10 +103,16 @@ class DashboardDataTests(unittest.TestCase):
 
     def test_new_die_validation_generates_id_and_normalizes_numbers(self):
         record = validate_new_die(valid_die_payload())
-        self.assertRegex(record["die_id"], r"^EXT-[A-F0-9]{12}$")
+        self.assertNotIn("die_id", record)
+        added = validate_added_die(valid_die_payload())
+        self.assertRegex(added["die_id"], r"^EXT-[A-F0-9]{12}$")
         self.assertEqual(record["die_x"], -4)
         self.assertEqual(record["scan_pass"], True)
         self.assertEqual(record["t_total_baseline_ms"], 630.5)
+
+    def test_die_update_preserves_existing_id(self):
+        record = validate_die_update(valid_die_payload(), "D000123")
+        self.assertEqual(record["die_id"], "D000123")
 
     def test_new_die_validation_rejects_incomplete_and_inconsistent_records(self):
         incomplete = valid_die_payload()
@@ -123,16 +129,6 @@ class DashboardDataTests(unittest.TestCase):
         invalid_bool["scan_pass"] = "true"
         with self.assertRaisesRegex(ValueError, "scan_pass must be true or false"):
             validate_new_die(invalid_bool)
-
-    def test_admin_session_cookie_expires_and_rejects_tampering(self):
-        password = "test-only-admin-secret"
-        expiry = 4_000_000_000
-        cookie = _session_cookie_value(password, expiry, "nonce")
-        with patch.dict("os.environ", {"DIE_ADMIN_PASSWORD": password}):
-            self.assertTrue(_valid_admin_session(f"mbist_admin={cookie}"))
-            self.assertFalse(_valid_admin_session(f"mbist_admin={cookie}tampered"))
-            expired = _session_cookie_value(password, 1, "nonce")
-            self.assertFalse(_valid_admin_session(f"mbist_admin={expired}"))
 
     def test_request_origin_requires_matching_host_and_scheme(self):
         self.assertTrue(
@@ -178,31 +174,70 @@ class DieSubmissionApiTests(unittest.TestCase):
         connection.close()
         return response.status, result, response_headers
 
-    def test_admin_login_and_die_submission(self):
-        with patch.dict(
-            "os.environ",
-            {"DIE_ADMIN_PASSWORD": "test-only-admin-secret",
-             "DATABASE_URL": "postgresql://test"},
-        ), patch.object(app_module, "_save_added_die") as save_die:
-            status, _, headers = self.request(
-                "POST", "/api/admin/session",
-                {"password": "test-only-admin-secret"},
-            )
-            self.assertEqual(status, 200)
-            cookie = headers["Set-Cookie"].split(";", 1)[0]
-
+    def test_public_die_submission_needs_no_sign_in(self):
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}), \
+                patch.object(app_module, "_save_added_die") as save_die:
             status, result, _ = self.request(
-                "POST", "/api/dies", valid_die_payload(), cookie
+                "POST", "/api/dies", valid_die_payload()
             )
             self.assertEqual(status, 201)
             self.assertTrue(result["saved"])
             self.assertTrue(result["item"]["die_id"].startswith("EXT-"))
             save_die.assert_called_once()
 
-    def test_die_submission_requires_admin_session(self):
-        status, result, _ = self.request("POST", "/api/dies", valid_die_payload())
-        self.assertEqual(status, 401)
-        self.assertIn("admin password", result["error"])
+    def test_public_die_submission_requires_database(self):
+        with patch.dict("os.environ", {}, clear=True):
+            status, result, _ = self.request(
+                "POST", "/api/dies", valid_die_payload()
+            )
+        self.assertEqual(status, 503)
+        self.assertIn("DATABASE_URL", result["error"])
+
+    def test_public_die_update_requires_existing_record_and_saves_override(self):
+        record = validate_added_die(valid_die_payload())
+        dataset = {"dies": [record], "memories": [], "failures": []}
+        payload = valid_die_payload()
+        payload["final_bin"] = "PASS_REPAIRED"
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}), \
+                patch.object(app_module, "get_dataset", return_value=dataset), \
+                patch.object(app_module, "_save_die_override") as save_override:
+            status, result, _ = self.request(
+                "PUT", f"/api/dies/{record['die_id']}", payload
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(result["item"]["die_id"], record["die_id"])
+            self.assertEqual(result["item"]["final_bin"], "PASS_REPAIRED")
+            save_override.assert_called_once()
+
+            status, result, _ = self.request(
+                "PUT", "/api/dies/UNKNOWN", payload
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(result["error"], "Die record not found.")
+
+    def test_public_status_reports_available_storage(self):
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+            status, result, _ = self.request("GET", "/api/die-editing/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["public_access"])
+
+    def test_public_write_rejects_foreign_origin(self):
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/dies",
+            body=json.dumps(valid_die_payload()),
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://attacker.example",
+            },
+        )
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 403)
+        self.assertIn("origin", result["error"])
 
 
 if __name__ == "__main__":

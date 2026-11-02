@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import hmac
 import io
 import json
@@ -12,12 +11,12 @@ import logging
 import math
 import os
 import re
-import secrets
 import time
 import uuid
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, unquote, urlparse
 
 
@@ -223,9 +222,42 @@ def _read_added_dies() -> list[dict]:
         ) from exc
 
 
+def _read_die_overrides() -> dict[str, dict]:
+    database_url = _database_url()
+    if not database_url:
+        return {}
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise StorageError(
+            "PostgreSQL support is unavailable. Install the project requirements."
+        ) from exc
+    try:
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT die_id, record FROM mbist_die_overrides")
+                return {die_id: record for die_id, record in cursor.fetchall()}
+    except psycopg.errors.UndefinedTable:
+        return {}
+    except psycopg.Error as exc:
+        logging.exception("Unable to read die record overrides from PostgreSQL")
+        raise StorageError(
+            "Unable to read die record updates. Check DATABASE_URL and database access."
+        ) from exc
+
+
 def get_dataset() -> dict[str, list[dict]]:
-    data = {name: list(rows) for name, rows in _get_base_dataset().items()}
-    data["dies"].extend(_read_added_dies())
+    data = {
+        name: [dict(row) for row in rows]
+        for name, rows in _get_base_dataset().items()
+    }
+    added_dies = _read_added_dies()
+    overrides = _read_die_overrides()
+    all_dies = data["dies"] + added_dies
+    for die in all_dies:
+        if die["die_id"] in overrides:
+            die.update(overrides[die["die_id"]])
+    data["dies"].extend(added_dies)
     return data
 
 
@@ -248,6 +280,15 @@ def initialize_die_storage() -> None:
                         die_id TEXT PRIMARY KEY,
                         record JSONB NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mbist_die_overrides (
+                        die_id TEXT PRIMARY KEY,
+                        record JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
                     """
                 )
@@ -322,7 +363,20 @@ def validate_new_die(payload: object) -> dict:
         + record["t_repair_ms"] + record["t_setup_readout_ms"], 1
     ):
         raise ValueError("t_total_baseline_ms must equal the sum of the time components.")
+    return record
+
+
+def validate_added_die(payload: object) -> dict:
+    record = validate_new_die(payload)
     record["die_id"] = f"EXT-{uuid.uuid4().hex[:12].upper()}"
+    return record
+
+
+def validate_die_update(payload: object, die_id: str) -> dict:
+    record = validate_new_die(payload)
+    if not die_id or len(die_id) > 80:
+        raise ValueError("die_id is invalid.")
+    record["die_id"] = die_id
     return record
 
 
@@ -362,42 +416,36 @@ def _save_added_die(record: dict) -> None:
         ) from exc
 
 
-def _admin_password() -> str | None:
-    password = os.environ.get("DIE_ADMIN_PASSWORD")
-    return password if password and len(password) >= 20 else None
-
-
-def _session_cookie_value(password: str, expiry: int, nonce: str) -> str:
-    message = f"{expiry}:{nonce}".encode("utf-8")
-    signature = hmac.new(
-        hashlib.sha256(password.encode("utf-8")).digest(),
-        message,
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{expiry}:{nonce}:{signature}"
-
-
-def _valid_admin_session(cookie_header: str | None) -> bool:
-    password = _admin_password()
-    if not password or not cookie_header:
-        return False
-    cookies = {}
-    for item in cookie_header.split(";"):
-        key, separator, value = item.strip().partition("=")
-        if separator:
-            cookies[key] = value
-    value = cookies.get("mbist_admin")
-    if not value:
-        return False
+def _save_die_override(record: dict) -> None:
+    database_url = _database_url()
+    if not database_url:
+        raise StorageError(
+            "Die updates are not enabled yet. Configure DATABASE_URL in Render."
+        )
     try:
-        expiry_text, nonce, signature = value.split(":", 2)
-        expiry = int(expiry_text)
-    except (ValueError, TypeError):
-        return False
-    if expiry <= int(time.time()):
-        return False
-    expected = _session_cookie_value(password, expiry, nonce)
-    return hmac.compare_digest(signature, expected.rsplit(":", 1)[1])
+        import psycopg
+        from psycopg.types.json import Jsonb
+    except ImportError as exc:
+        raise StorageError(
+            "PostgreSQL support is unavailable. Install the project requirements."
+        ) from exc
+    try:
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO mbist_die_overrides (die_id, record)
+                    VALUES (%s, %s)
+                    ON CONFLICT (die_id) DO UPDATE
+                    SET record = EXCLUDED.record, updated_at = now()
+                    """,
+                    (record["die_id"], Jsonb(record)),
+                )
+    except psycopg.Error as exc:
+        logging.exception("Unable to save die record update")
+        raise StorageError(
+            "Unable to save die record update. Check DATABASE_URL and database permissions."
+        ) from exc
 
 
 def validate_request_origin(headers) -> bool:
@@ -409,6 +457,27 @@ def validate_request_origin(headers) -> bool:
     if protocol not in {"http", "https"}:
         return False
     return hmac.compare_digest(origin.rstrip("/"), f"{protocol}://{host}".rstrip("/"))
+
+
+_write_attempts: dict[str, list[float]] = {}
+_write_attempts_lock = Lock()
+
+
+def allow_public_write(client_ip: str, now: float | None = None) -> bool:
+    current_time = now if now is not None else time.monotonic()
+    with _write_attempts_lock:
+        recent = [
+            attempt for attempt in _write_attempts.get(client_ip, [])
+            if current_time - attempt < 60
+        ]
+        if len(recent) >= 30:
+            _write_attempts[client_ip] = recent
+            return False
+        recent.append(current_time)
+        _write_attempts[client_ip] = recent
+        if len(_write_attempts) > 10_000:
+            _write_attempts.clear()
+        return True
 
 
 def _mean(rows: list[dict], column: str) -> float:
@@ -765,21 +834,16 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
                     {
                         "status": "ok",
                         "rows": {name: len(rows) for name, rows in data.items()},
-                        "die_submission_enabled": bool(
-                            _database_url() and _admin_password()
-                        ),
+                        "public_die_edits_enabled": bool(_database_url()),
                     },
                 )
-            elif path == "/api/admin/session":
+            elif path == "/api/die-editing/status":
                 self._send_json(
                     200,
                     {
-                        "configured": bool(_admin_password() and _database_url()),
+                        "configured": bool(_database_url()),
                         "storage_configured": bool(_database_url()),
-                        "admin_password_configured": bool(_admin_password()),
-                        "authenticated": _valid_admin_session(
-                            self.headers.get("Cookie")
-                        ),
+                        "public_access": True,
                     },
                 )
             elif path == "/api/summary":
@@ -789,6 +853,16 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
             elif path in ("/api/dies", "/api/memories", "/api/failures"):
                 table = path.rsplit("/", 1)[-1]
                 self._send_json(200, query_table(get_dataset(), table, query))
+            elif path.startswith("/api/dies/"):
+                die_id = path.removeprefix("/api/dies/")
+                die = next(
+                    (row for row in get_dataset()["dies"] if row["die_id"] == die_id),
+                    None,
+                )
+                if die is None:
+                    self._send_error_json(404, "Die record not found.")
+                else:
+                    self._send_json(200, {"item": die})
             elif path.startswith("/api/download/"):
                 table = path.rsplit("/", 1)[-1]
                 if table not in DATA_FILES:
@@ -827,54 +901,27 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
     def _request_origin_is_valid(self) -> bool:
         return validate_request_origin(self.headers)
 
-    def _send_session_cookie(self, password: str) -> None:
-        expiry = int(time.time()) + 8 * 60 * 60
-        value = _session_cookie_value(password, expiry, secrets.token_urlsafe(24))
-        secure = (
-            self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
-            == "https"
-        )
-        self.send_response(200)
-        self._headers("application/json; charset=utf-8", len(b'{"authenticated":true}'))
-        self.send_header(
-            "Set-Cookie",
-            "mbist_admin=" + value
-            + f"; Path=/; Max-Age={8 * 60 * 60}; HttpOnly; SameSite=Strict"
-            + ("; Secure" if secure else ""),
-        )
-        self.end_headers()
-        self.wfile.write(b'{"authenticated":true}')
-
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
             if not self._request_origin_is_valid():
                 self._send_error_json(403, "Request origin is not allowed.")
                 return
-            if path == "/api/admin/session":
-                if not _admin_password():
+            if path == "/api/dies":
+                client_ip = self.headers.get(
+                    "X-Forwarded-For", self.client_address[0]
+                ).split(",", 1)[0].strip()
+                if not allow_public_write(client_ip):
                     self._send_error_json(
-                        503, "Admin access is not configured on the server."
+                        429, "Too many changes from this connection. Please wait a minute and try again."
                     )
-                    return
-                payload = self._read_json_body()
-                supplied = payload.get("password")
-                if not isinstance(supplied, str) or not hmac.compare_digest(
-                    supplied, _admin_password()
-                ):
-                    self._send_error_json(401, "Incorrect admin password.")
-                    return
-                self._send_session_cookie(_admin_password())
-            elif path == "/api/dies":
-                if not _valid_admin_session(self.headers.get("Cookie")):
-                    self._send_error_json(401, "Sign in with the admin password first.")
                     return
                 if not _database_url():
                     self._send_error_json(
                         503, "Die submissions are not enabled yet. Configure DATABASE_URL in Render."
                     )
                     return
-                record = validate_new_die(self._read_json_body())
+                record = validate_added_die(self._read_json_body())
                 _save_added_die(record)
                 self._send_json(201, {"item": record, "saved": True})
             else:
@@ -885,27 +932,51 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
             logging.error("Die storage unavailable: %s", exc)
             self._send_error_json(503, str(exc))
 
-    def do_DELETE(self) -> None:
+    def do_PUT(self) -> None:
         path = urlparse(self.path).path
-        if path != "/api/admin/session":
-            self._send_error_json(404, "Route not found.")
-            return
-        if not self._request_origin_is_valid():
-            self._send_error_json(403, "Request origin is not allowed.")
-            return
-        secure = (
-            self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
-            == "https"
-        )
-        self.send_response(200)
-        self._headers("application/json; charset=utf-8", len(b'{"authenticated":false}'))
-        self.send_header(
-            "Set-Cookie",
-            "mbist_admin=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
-            + ("; Secure" if secure else ""),
-        )
-        self.end_headers()
-        self.wfile.write(b'{"authenticated":false}')
+        prefix = "/api/dies/"
+        try:
+            if not self._request_origin_is_valid():
+                self._send_error_json(403, "Request origin is not allowed.")
+                return
+            if not path.startswith(prefix):
+                self._send_error_json(404, "Route not found.")
+                return
+            client_ip = self.headers.get(
+                "X-Forwarded-For", self.client_address[0]
+            ).split(",", 1)[0].strip()
+            if not allow_public_write(client_ip):
+                self._send_error_json(
+                    429, "Too many changes from this connection. Please wait a minute and try again."
+                )
+                return
+            if not _database_url():
+                self._send_error_json(
+                    503, "Die updates are not enabled yet. Configure DATABASE_URL in Render."
+                )
+                return
+            die_id = unquote(path[len(prefix):])
+            if not die_id or "/" in die_id:
+                self._send_error_json(400, "die_id is invalid.")
+                return
+            current = next(
+                (row for row in get_dataset()["dies"] if row["die_id"] == die_id),
+                None,
+            )
+            if current is None:
+                self._send_error_json(404, "Die record not found.")
+                return
+            record = validate_die_update(self._read_json_body(), die_id)
+            _save_die_override(record)
+            self._send_json(200, {"item": record, "saved": True})
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+        except StorageError as exc:
+            logging.error("Die storage unavailable: %s", exc)
+            self._send_error_json(503, str(exc))
+
+    def do_DELETE(self) -> None:
+        self._send_error_json(404, "Route not found.")
 
     def _send_static(self, filename: str) -> None:
         if filename not in ("index.html", "app.js", "styles.css"):
@@ -935,6 +1006,23 @@ class MbistRequestHandler(BaseHTTPRequestHandler):
             return
         if table == "dies":
             added_dies = _read_added_dies()
+            overrides = _read_die_overrides()
+            for record in added_dies:
+                if record["die_id"] in overrides:
+                    record.update(overrides[record["die_id"]])
+            if overrides:
+                with path.open("r", encoding="utf-8-sig", newline="") as source:
+                    reader = csv.DictReader(source)
+                    original = list(reader)
+                    fieldnames = reader.fieldnames or []
+                extra = io.StringIO(newline="")
+                writer = csv.DictWriter(extra, fieldnames=fieldnames, lineterminator="\n")
+                for row in original:
+                    override = overrides.get(row["die_id"])
+                    if override:
+                        row.update({key: str(value) for key, value in override.items()})
+                    writer.writerow(row)
+                body = (",".join(fieldnames) + "\n").encode("utf-8") + extra.getvalue().encode("utf-8")
             if added_dies:
                 with path.open("r", encoding="utf-8-sig", newline="") as source:
                     fieldnames = next(csv.reader(source))
