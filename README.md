@@ -92,6 +92,12 @@ Then open `http://127.0.0.1:8000`. The server binds to localhost by default. Cha
 
 In VS Code, choose **Terminal → Run Task → Start MBIST Website**. Run **Test MBIST Backend** from the same menu to execute the tests.
 
+### Deploy to Render
+
+[Deploy this project to Render](https://render.com/deploy?repo=https://github.com/Grandheyaswanth2835/Devsys-project). Render reads `render.yaml` and deploys the frontend and backend together as one Python web service. This keeps the frontend's relative `/api/...` requests on the same origin and avoids separate-service CORS configuration.
+
+After deployment, use the Render service URL for the dashboard and append `/api/health` to check the backend, for example `https://YOUR-SERVICE.onrender.com/api/health`. Render assigns the actual service URL after you sign in and create the service; it cannot be known before deployment.
+
 Project layout:
 
 ```text
