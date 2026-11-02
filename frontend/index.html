@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101a2d">
+  <title>MBIST Lab · Test Intelligence</title>
+  <link rel="stylesheet" href="/frontend/styles.css">
+  <script src="/frontend/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="MBIST Lab dashboard">
+        <span class="brand-mark">M</span>
+        <span><strong>MBIST LAB</strong><small>TEST INTELLIGENCE</small></span>
+      </a>
+      <div class="nav-caption">WORKSPACE</div>
+      <nav class="navigation" aria-label="Main navigation">
+        <button class="nav-item active" data-view="overview"><span>◫</span>Overview</button>
+        <button class="nav-item" data-view="dies"><span>◉</span>Die results</button>
+        <button class="nav-item" data-view="memories"><span>▦</span>Memory inventory</button>
+        <button class="nav-item" data-view="failures"><span>⌁</span>Fail events</button>
+        <button class="nav-item" data-view="analysis"><span>⌘</span>Test analysis</button>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="dataset-note">
+        <span class="live-dot"></span>
+        <div><strong>Synthetic dataset</strong><small>Local data · Seed 7</small></div>
+      </div>
+      <div class="sidebar-foot">MBIST TEST TIME REDUCTION<br>DEMONSTRATION BUILD</div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Workspace</span><b>/</b><strong id="crumb">Overview</strong></div>
+        <div class="top-actions">
+          <span class="status-pill"><span class="live-dot"></span><span id="health-label">Connecting</span></span>
+          <a class="button button-quiet" href="/api/download/dies">Export die CSV</a>
+        </div>
+      </header>
+      <section id="content" class="content" aria-live="polite">
+        <div class="loading-panel"><span class="spinner"></span>Loading MBIST dataset…</div>
+      </section>
+      <footer class="page-footer">
+        <span>All measurements are synthetic and for method development only.</span>
+        <span>MBIST LAB <b>·</b> LOCAL DASHBOARD</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
